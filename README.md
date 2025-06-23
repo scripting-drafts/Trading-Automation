@@ -1,5 +1,5 @@
 # High Risk Auto Trade  
-Trading automation with Binance through Telegram  
+Trading automation with Binance through Telegram, with the help of Coingecko  
   <br />  
 
 ### How does it work
