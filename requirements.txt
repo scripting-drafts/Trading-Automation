@@ -1,0 +1,4 @@
+python-binance
+pandas
+aiohttp
+python-telegram-bot
