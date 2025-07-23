@@ -4,7 +4,13 @@ from datetime import datetime
 from statistics import stdev
 from binance.client import Client
 from pycoingecko import CoinGeckoAPI
-from secret import API_KEY, API_SECRET
+from dotenv import load_dotenv
+load_dotenv()
+
+import os
+
+API_KEY = os.environ['BINANCE_KEY']
+API_SECRET = os.environ['BINANCE_SECRET']
 
 OUTPUT_FILE = "symbols.yaml"
 UPDATE_INTERVAL = 300  # <-- in seconds (e.g., 300 = 5 minutes)

@@ -4,3 +4,7 @@ aiohttp
 python-telegram-bot
 apscheduler
 python-dotenv
+ccxt>=4.0.0
+pyyaml>=5.3
+requests>=2.20
+pycoingecko
