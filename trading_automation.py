@@ -594,7 +594,7 @@ def auto_sell_momentum_positions(min_profit=MIN_PROFIT, trailing_stop=TRAIL_STOP
 
 
 def get_1h_percent_change(symbol):
-    # Get last 2 hourly candles
+    '''Get last 2 hourly candles'''
     klines = client.get_klines(symbol=symbol, interval='1h', limit=2)
     if len(klines) < 2:
         return 0
@@ -603,7 +603,7 @@ def get_1h_percent_change(symbol):
     return (last_close - prev_close) / prev_close * 100
 
 def market_is_risky():
-    # For example, check if BTCUSDT 1h change is negative or > X% move
+    '''For example, check if BTCUSDT 1h change is negative or > X% move'''
     btc_change_1h = get_1h_percent_change("BTCUSDT")
     return btc_change_1h < -1 or abs(btc_change_1h) > 3
 
