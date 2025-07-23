@@ -3,3 +3,4 @@ pandas
 aiohttp
 python-telegram-bot
 apscheduler
+python-dotenv
