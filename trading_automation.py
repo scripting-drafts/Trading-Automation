@@ -24,7 +24,7 @@ import os
 API_KEY = os.environ['BINANCE_KEY']
 API_SECRET = os.environ['BINANCE_SECRET']
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
-TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+TELEGRAM_CHAT_ID = int(os.environ['TELEGRAM_CHAT_ID'])
 
 import apscheduler.util
 
