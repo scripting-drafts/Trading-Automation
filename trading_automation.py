@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import requests.exceptions
 
 API_KEY = os.environ['BINANCE_KEY']
 API_SECRET = os.environ['BINANCE_SECRET']
@@ -164,10 +165,10 @@ def fetch_usdc_balance():
         print(f"[ERROR] Fetching USDC balance: {e}")
         balance['usd'] = 0
 
-def get_latest_price(symbol):
+def get_latest_price(symbol, timeout=5):
     try:
-        return float(client.get_symbol_ticker(symbol=symbol)["price"])
-    except Exception as e:
+        return float(client.get_symbol_ticker(symbol=symbol, timeout=timeout)["price"])
+    except (BinanceAPIException, requests.exceptions.Timeout) as e:
         print(f"[PRICE ERROR] {symbol}: {e}")
         return None
 
@@ -284,7 +285,16 @@ async def telegram_handle_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     text = update.message.text
-    sync_positions_with_binance(client, positions)
+    
+    # Run sync in background thread to keep telegram responsive
+    def bg_sync():
+        try:
+            sync_positions_with_binance(client, positions)
+        except Exception as e:
+            print(f"[SYNC ERROR] {e}")
+    
+    # Don't block the telegram handler
+    threading.Thread(target=bg_sync).start()
 
     if text == "📊 Balance":
         fetch_usdc_balance()
@@ -358,6 +368,26 @@ async def telegram_handle_message(update: Update, context: ContextTypes.DEFAULT_
                     print(f"[WARN] Bad trade log row: {tr} ({e})")
                     continue
             await send_with_keyboard(update, f"```{msg}```", parse_mode='Markdown')
+    elif text == "🚀 Force Trade":
+        # Simple force trade that doesn't do heavy processing
+        fetch_usdc_balance()
+        if balance['usd'] < 10:
+            await send_with_keyboard(update, "❌ Not enough USDC balance (min $10 needed)")
+            return
+        
+        symbol = "BTCUSDC"  # Default to Bitcoin
+        amount = min(balance['usd'], 10)  # Use at most $10 or available balance
+        
+        # Run buy in separate thread to keep telegram responsive
+        def do_buy():
+            try:
+                result = buy(symbol, amount=amount)
+                return result is not None
+            except Exception:
+                return False
+                
+        threading.Thread(target=do_buy).start()
+        await send_with_keyboard(update, f"🔄 Attempting to buy {symbol} for ${amount:.2f}...")
     else:
         await send_with_keyboard(update, "Unknown action.")
 
@@ -399,7 +429,7 @@ def is_paused():
 main_keyboard = [
     ["📊 Balance", "💼 Investments"],
     ["⏸ Pause Trading", "▶️ Resume Trading"],
-    ["📝 Trade Log"]
+    ["📝 Trade Log", "🚀 Force Trade"]
 ]
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -975,37 +1005,47 @@ def process_actions():
 def trading_loop():
     last_sync = time.time()
     SYNC_INTERVAL = 180
+    iteration = 0
+    
+    # Run the initial trade in a separate thread to not block
+    if balance['usd'] > 10 and not is_paused():
+        threading.Thread(target=lambda: debug_force_buy("BTCUSDC", min(balance['usd'], 10))).start()
 
     while True:
+        iteration += 1
         try:
-            if market_is_risky():
-                print("[INFO] Market too volatile. Skipping investing this round.")
-                time.sleep(SYNC_INTERVAL)
-                continue
-
-            if is_paused():
-                print("[INFO] Bot is paused. Skipping trading logic.")
+            # Simplified checks - less logging
+            if market_is_risky() or is_paused():
                 time.sleep(SYNC_INTERVAL)
                 continue
 
             fetch_usdc_balance()
-            auto_sell_momentum_positions()  # <<< use new sell logic
+            
+            # Auto-sell and reinvest with timeout protection
+            try:
+                auto_sell_momentum_positions()
+                
+                if time.time() - last_sync > SYNC_INTERVAL:
+                    sync_investments_with_binance()
+                    last_sync = time.time()
 
-            if time.time() - last_sync > SYNC_INTERVAL:
-                sync_investments_with_binance()
-                last_sync = time.time()
-
-            if not too_many_positions():
-                reserve_taxes_and_reinvest()  # <<<< THIS IS THE NEW LOGIC
+                if not too_many_positions() and balance['usd'] > 10:
+                    invest_momentum_with_usdc_limit(balance['usd'] - 1)  # Leave 1 USDC as buffer
+            except (BinanceAPIException, requests.exceptions.Timeout) as e:
+                print(f"[API ERROR] Trading operation failed: {e}")
+                time.sleep(10)  # Wait 10 seconds before retrying after API error
+                continue
 
             sync_state()
             process_actions()
-            fetch_usdc_balance()
+            
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
 
-        sync_positions_with_binance(client, positions)
-        display_portfolio(positions, get_latest_price)
+        # Only display portfolio every 5 iterations to reduce load
+        if iteration % 5 == 0:
+            display_portfolio(positions, get_latest_price)
+            
         time.sleep(SYNC_INTERVAL)
 
 def resume_positions_from_binance():
@@ -1099,45 +1139,23 @@ def emergency_trade():
 
 # 5. Modify the main block to include more diagnostic info and emergency trading
 if __name__ == "__main__":
+    # Store bot start time
+    bot_start_time = time.time()
+    
+    # Basic initialization
     refresh_symbols()
     trade_log = load_trade_history()
     positions.clear()
     positions.update(rebuild_cost_basis(trade_log))
-    reconcile_positions_with_binance(client, positions)
-    
-    # Check if YAML file exists and has valid data
-    symbols_data = load_symbol_stats()
-    print(f"[INFO] Loaded {len(symbols_data)} symbols from YAML file")
-    
-    # Print paused state
-    paused = is_paused()
-    print(f"[INFO] Bot paused state on startup: {paused}")
-    
-    # Check USDC balance
-    fetch_usdc_balance()
-    print(f"[INFO] Starting USDC balance: ${balance['usd']}")
-    
-    # Make initial investment if conditions are right
-    if not paused and balance['usd'] > 10:
-        print("[INFO] Bot is unpaused and has funds. Making initial investments...")
-        try:
-            # Try regular investment first
-            momentum_symbols = get_yaml_ranked_momentum(limit=3)
-            if momentum_symbols:
-                print(f"[INFO] Found momentum symbols: {momentum_symbols}")
-                reserve_taxes_and_reinvest()
-            else:
-                print("[WARN] No momentum symbols found. Trying emergency trade...")
-                emergency_trade()
-        except Exception as e:
-            print(f"[ERROR] Initial investment failed: {e}")
-            print("[INFO] Trying emergency trade...")
-            emergency_trade()
     
     try:
+        # Start trading thread first for responsiveness
         trading_thread = threading.Thread(target=trading_loop, daemon=True)
         trading_thread.start()
-        telegram_main()  # This blocks; run in main thread for proper Ctrl+C
+        
+        # Then initialize Telegram - it's blocking but that's fine
+        print("[INFO] Starting Telegram bot...")
+        telegram_main()
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down gracefully...")
     finally:
