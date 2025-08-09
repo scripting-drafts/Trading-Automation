@@ -432,7 +432,25 @@ def quote_precision_for(symbol):
     except Exception:
         return 2
 
-def buy(symbol, amount=None):
+async def async_fetch_usdc_balance():
+    try:
+        asset_info = await asyncio.to_thread(client.get_asset_balance, asset="USDC")
+        free = float(asset_info['free'])
+        balance['usd'] = free
+        print(f"[DEBUG] Live USDC balance: {free}")
+    except Exception as e:
+        print(f"[ERROR] Fetching USDC balance: {e}")
+        balance['usd'] = 0
+
+async def async_get_latest_price(symbol):
+    try:
+        result = await asyncio.to_thread(client.get_symbol_ticker, symbol=symbol)
+        return float(result["price"])
+    except Exception as e:
+        print(f"[PRICE ERROR] {symbol}: {e}")
+        return None
+
+async def async_buy(symbol, amount=None):
     print(f"[DEBUG] Actual USDC balance before buy: {balance['usd']}")
     try:
         precision = quote_precision_for(symbol)
@@ -442,8 +460,7 @@ def buy(symbol, amount=None):
         if trade_amount < min_notional:
             print(f"[SKIP] {symbol}: Trade amount (${trade_amount}) < MIN_NOTIONAL (${min_notional})")
             return None
-        # Let Binance handle rounding/fees
-        order = client.order_market_buy(symbol=symbol, quoteOrderQty=trade_amount)
+        order = await asyncio.to_thread(client.order_market_buy, symbol=symbol, quoteOrderQty=trade_amount)
         price = float(order['fills'][0]['price'])
         qty = float(order['executedQty'])
         qty = round_qty(symbol, qty)
@@ -461,107 +478,48 @@ def buy(symbol, amount=None):
         print(f"[BUY ERROR] {symbol}: {e}")
         return None
 
-def sell(symbol, qty):
+async def async_sell(symbol, qty):
     try:
         sell_qty = round_qty(symbol, qty)
-        current_price = get_latest_price(symbol)
+        current_price = await async_get_latest_price(symbol)
         value = current_price * sell_qty
         if sell_qty == 0 or qty == 0:
-            # print(f"[SKIP] {symbol}: Qty after rounding is 0. Skipping sell for now.")
             return None, 0, 0
         if value < DUST_LIMIT:
             print(f"[SKIP] {symbol}: Value after rounding is ${value:.2f} (below DUST_LIMIT ${DUST_LIMIT}), skipping sell.")
             return None, 0, 0
-        
-        order = client.order_market_sell(symbol=symbol, quantity=sell_qty)
+        order = await asyncio.to_thread(client.order_market_sell, symbol=symbol, quantity=sell_qty)
         price = float(order['fills'][0]['price'])
         fee = sum(float(f['commission']) for f in order['fills']) if "fills" in order else 0
         return price, fee, 0
     except BinanceAPIException as e:
         print(f"[SELL ERROR] {symbol}: {e}")
-        # Do not remove from positions here.
         return None, 0, 0
 
-def estimate_trade_tax(entry_price, exit_price, qty, trade_time, exit_time):
-    """
-    Estimates the tax for a given trade based on holding period and gain.
-    Uses 40% for short-term (<24h), 25% for long-term (>=24h).
-    """
-    trade_time = parse_trade_time(trade_time, time.time())
-    exit_time = parse_trade_time(exit_time, time.time())
-    trade_time_float = parse_trade_time(trade_time, time.time())
-    exit_time_float = parse_trade_time(exit_time, time.time())
-    holding_period = exit_time_float - trade_time_float
-    profit = (exit_price - entry_price) * qty
-    short_term_rate = 0.40
-    long_term_rate = 0.25
-    if holding_period < 24 * 3600:
-        rate = short_term_rate
-    else:
-        rate = long_term_rate
-    tax = profit * rate if profit > 0 else 0
-    return tax
-
-
-def log_trade(symbol, entry, exit_price, qty, trade_time, exit_time, fees=0, tax=0, action="sell"):
-    pnl = (exit_price - entry) * qty if action == "sell" else 0
-    pnl_pct = ((exit_price - entry) / entry * 100) if action == "sell" and entry != 0 else 0
-    duration_sec = int(
-    parse_trade_time(exit_time, time.time()) - parse_trade_time(trade_time, time.time())
-    )
-    trade = {
-        'Time': datetime.fromtimestamp(trade_time).strftime("%Y-%m-%d %H:%M:%S"),
-        'Action': action,
-        'Symbol': symbol,
-        'Entry': round(entry, 8),
-        'Exit': round(exit_price, 8),
-        'Qty': round(qty, 8),
-        'PnL $': round(pnl, 8),
-        'PnL %': round(pnl_pct, 3),
-        'Duration (s)': duration_sec,
-        'Fees': round(fees, 8),
-        'Tax': round(tax, 8)
-    }
-    try:
-        file_exists = os.path.isfile(TRADE_LOG_FILE)
-        with open(TRADE_LOG_FILE, "a", newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=list(trade.keys()))
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(trade)
-    except Exception as e:
-        print(f"[LOG ERROR] {e}")
-
-def auto_sell_momentum_positions(min_profit=MIN_PROFIT, trailing_stop=TRAIL_STOP, max_hold_time=MAX_HOLD_TIME):
+async def async_auto_sell_momentum_positions(min_profit=MIN_PROFIT, trailing_stop=TRAIL_STOP, max_hold_time=MAX_HOLD_TIME):
     now = time.time()
     for symbol, pos in list(positions.items()):
         try:
             entry = float(pos['entry'])
             qty = float(pos['qty'])
             trade_time = parse_trade_time(pos.get('trade_time', now), now)
-
-            current_price = get_latest_price(symbol)
+            current_price = await async_get_latest_price(symbol)
             if current_price is None:
                 print(f"[SKIP] {symbol}: Could not fetch price (None), skipping auto-sell logic.")
                 continue
-
             sell_qty = round_qty(symbol, qty)
             value = current_price * sell_qty
             if sell_qty == 0 or qty == 0:
-                # print(f"[SKIP] {symbol}: Qty after rounding is 0. Skipping sell for now.")
                 continue
             if value < DUST_LIMIT:
                 print(f"[SKIP] {symbol}: Value after rounding is ${value:.2f} (below DUST_LIMIT ${DUST_LIMIT}), skipping sell.")
                 continue
-
             pnl_pct = ((current_price - entry) / entry * 100) if entry else 0
             held_for = now - trade_time
-
             if 'max_price' not in pos:
                 pos['max_price'] = entry
             pos['max_price'] = max(pos['max_price'], current_price)
             trail_pct = (current_price - pos['max_price']) / pos['max_price'] * 100
-
             should_sell = False
             reason = ""
             if pnl_pct >= min_profit and trail_pct <= -trailing_stop:
@@ -570,9 +528,8 @@ def auto_sell_momentum_positions(min_profit=MIN_PROFIT, trailing_stop=TRAIL_STOP
             elif held_for >= max_hold_time:
                 should_sell = True
                 reason = f"Timed exit after {held_for/60:.1f} minutes."
-
             if should_sell:
-                exit_price, fee, _ = sell(symbol, qty)
+                exit_price, fee, _ = await async_sell(symbol, qty)
                 exit_time = time.time()
                 tax = estimate_trade_tax(entry, exit_price, qty, trade_time, exit_time)
                 log_trade(
@@ -591,111 +548,33 @@ def auto_sell_momentum_positions(min_profit=MIN_PROFIT, trailing_stop=TRAIL_STOP
         except Exception as e:
             print(f"[AUTO-SELL ERROR] {symbol}: {e}")
 
-
-
-def get_1h_percent_change(symbol):
-    '''Get last 2 hourly candles'''
-    klines = client.get_klines(symbol=symbol, interval='1h', limit=2)
-    if len(klines) < 2:
-        return 0
-    prev_close = float(klines[0][4])
-    last_close = float(klines[1][4])
-    return (last_close - prev_close) / prev_close * 100
-
-def market_is_risky():
-    '''For example, check if BTCUSDT 1h change is negative or > X% move'''
-    btc_change_1h = get_1h_percent_change("BTCUSDT")
-    return btc_change_1h < -1 or abs(btc_change_1h) > 3
-
-def sync_investments_with_binance():
-    try:
-        account_info = client.get_account()
-        # Keep ALL nonzero assets except base asset (USDC)
-        balances = {
-            a["asset"]: float(a["free"])
-            for a in account_info["balances"]
-            if float(a["free"]) > 0.0001 and a["asset"] != BASE_ASSET
-        }
-        new_positions = {}
-        for asset, amount in balances.items():
-            symbol = f"{asset}{BASE_ASSET}"
-            try:
-                price = float(client.get_symbol_ticker(symbol=symbol)["price"])
-                new_positions[symbol] = {
-                    "entry": price,  # For new syncs, "entry" is current price, unless you have historical
-                    "qty": amount,
-                    "timestamp": time.time(),
-                    "trade_time": time.time()
-                }
-            except Exception:
-                continue
-        positions.clear()
-        positions.update(new_positions)
-        print("[INFO] Synced investments with real Binance balances.")
-    except Exception as e:
-        print(f"[SYNC ERROR] Could not sync investments with Binance: {e}")
-
-def too_many_positions():
-    count = 0
-    for symbol, pos in positions.items():
-        price = get_latest_price(symbol)
-        if price is None:
-            continue
-        if pos.get('qty', 0) * price > DUST_LIMIT:
-            count += 1
-    return count >= MAX_POSITIONS
-
-
-def reserve_taxes_and_reinvest():
-    """
-    Reserve USDC for taxes by selling just enough, from as many profitable (non-core, long-term) positions as needed.
-    - Sells non-core first, then core if needed.
-    - Avoids short-term gains unless required.
-    - Uses real min_notional for every symbol.
-    """
-    # Helper: core coin detection
+async def async_reserve_taxes_and_reinvest():
     def is_core(symbol):
         stats = load_symbol_stats()
         info = stats.get(symbol, {})
         return info.get("core", False)
-
-    # Helper: short-term check
-    SHORT_TERM_SECONDS = 24 * 3600  # 24 hours, adjust if needed
+    SHORT_TERM_SECONDS = 24 * 3600
     def is_short_term(pos):
         trade_time = parse_trade_time(pos.get('trade_time', time.time()), time.time())
         held_for = time.time() - trade_time
         return held_for < SHORT_TERM_SECONDS
-
-
-    # Helper: profit calculation
     def position_profit(sym):
         pos = positions[sym]
-        cur_price = get_latest_price(sym)
+        cur_price = asyncio.run(async_get_latest_price(sym))
         entry = pos['entry']
         return (cur_price - entry) * pos['qty']
-
-    # 1. Calculate taxes owed from recent closed trades
     total_taxes_owed = sum(
         float(tr.get('Tax', 0)) for tr in trade_log[-20:] if float(tr.get('Tax', 0)) > 0
     )
-
-    fetch_usdc_balance()
+    await async_fetch_usdc_balance()
     free_usdc = balance['usd']
-
-    # 2. Sell as little as needed from as many positions as needed
     while True:
-        # Calculate how much USDC we still need to invest after tax reserve
         needed_usdc = 0
-
-        # We'll use the minimum min_notional for ALL symbols in momentum (safe fallback)
         momentum_symbols = get_yaml_ranked_momentum(limit=3)
         min_notional = min([min_notional_for(sym) for sym in momentum_symbols] + [10.0])
-
         needed_usdc = (min_notional + total_taxes_owed) - free_usdc
         if needed_usdc <= 0:
-            break  # We have enough, done selling
-
-        # Step 1: Try non-core, profitable, long-term positions
+            break
         candidates = [
             sym for sym in positions
             if position_profit(sym) > 0
@@ -703,7 +582,6 @@ def reserve_taxes_and_reinvest():
             and not is_core(sym)
             and not is_short_term(positions[sym])
         ]
-        # Step 2: If none, try core, profitable, long-term positions
         if not candidates:
             candidates = [
                 sym for sym in positions
@@ -712,7 +590,6 @@ def reserve_taxes_and_reinvest():
                 and is_core(sym)
                 and not is_short_term(positions[sym])
             ]
-        # Step 3: If still none, allow non-core, profitable, short-term positions
         if not candidates:
             candidates = [
                 sym for sym in positions
@@ -720,21 +597,144 @@ def reserve_taxes_and_reinvest():
                 and round_qty(sym, positions[sym]['qty']) > 0
                 and not is_core(sym)
             ]
-        # Step 4: Last resort, allow core, profitable, short-term positions
         if not candidates:
             candidates = [
                 sym for sym in positions
                 if position_profit(sym) > 0
                 and round_qty(sym, positions[sym]['qty']) > 0
             ]
-        # If still none, give up
         if not candidates:
             print("[TAXES] No profitable positions to sell for taxes. Waiting to accumulate more USDC.")
             break
-
-        # Sort: non-core first, lowest profit first (to avoid selling strong winners)
         candidates = sorted(
             candidates,
+            key=lambda sym: (is_core(sym), position_profit(sym))
+        )
+        symbol_to_sell = candidates[0]
+        pos = positions[symbol_to_sell]
+        cur_price = asyncio.run(async_get_latest_price(symbol_to_sell))
+        entry = pos['entry']
+        qty_available = pos['qty']
+        trade_time = pos.get('trade_time', time.time())
+        min_notional_this = min_notional_for(symbol_to_sell)
+        await async_fetch_usdc_balance()
+        free_usdc = balance['usd']
+        needed_usdc = (min_notional + total_taxes_owed) - free_usdc
+        qty_to_sell = min(qty_available, max(needed_usdc / cur_price, min_notional_this / cur_price))
+        qty_to_sell = round_qty(symbol_to_sell, qty_to_sell)
+        if qty_to_sell == 0:
+            print(f"[SKIP] {symbol_to_sell}: Qty after rounding is 0. Skipping this position for now.")
+            del positions[symbol_to_sell]
+            continue
+        print(
+            f"[TAXES] Selling {qty_to_sell:.6f} {symbol_to_sell} "
+            f"(profit: {position_profit(symbol_to_sell):.2f}, core: {is_core(symbol_to_sell)}, short-term: {is_short_term(pos)}) "
+            f"to free up USDC for taxes."
+        )
+        exit_price, fee, tax = await async_sell(symbol_to_sell, qty_to_sell)
+        if exit_price is None:
+            print(f"[SKIP] {symbol_to_sell}: Sell returned None. Skipping this position for now.")
+            del positions[symbol_to_sell]
+            continue
+        exit_time = time.time()
+        log_trade(symbol_to_sell, entry, exit_price, qty_to_sell, trade_time, exit_time, fee, tax, action="sell")
+        if qty_to_sell == qty_available:
+            del positions[symbol_to_sell]
+        else:
+            positions[symbol_to_sell]['qty'] -= qty_to_sell
+        await async_fetch_usdc_balance()
+        free_usdc = balance['usd']
+    investable_usdc = free_usdc - total_taxes_owed
+    if investable_usdc < min_notional:
+        print("[TAXES] Not enough USDC to invest after reserving for taxes.")
+        return
+    await async_invest_momentum_with_usdc_limit(investable_usdc)
+
+async def async_invest_momentum_with_usdc_limit(usdc_limit):
+    refresh_symbols()
+    symbols = get_yaml_ranked_momentum(limit=10)
+    print(f"[DEBUG] Momentum symbols eligible for investment: {symbols}")
+    if not symbols:
+        print("[DIAGNOSE] No symbols passed the momentum and filter criteria.")
+        return
+    if usdc_limit < 1:
+        print("[INFO] Insufficient funds.")
+        return
+    min_notionals = []
+    for symbol in symbols:
+        min_notional = min_notional_for(symbol)
+        min_notionals.append((symbol, min_notional))
+    total_spent = 0
+    symbols_to_buy = []
+    for symbol, min_notional in sorted(min_notionals, key=lambda x: -x[1]):
+        if usdc_limit - total_spent >= min_notional:
+            symbols_to_buy.append((symbol, min_notional))
+            total_spent += min_notional
+    if not symbols_to_buy:
+        print(f"[INFO] Not enough USDC to invest in any eligible symbol. Minimum needed: {min([mn for s, mn in min_notionals]):.2f} USDC.")
+        return
+    for symbol, min_notional in symbols_to_buy:
+        amount = min_notional
+        await async_fetch_usdc_balance()
+        if balance['usd'] < amount:
+            print(f"[INFO] Out of funds before buying {symbol}.")
+            break
+        print(f"[INFO] Attempting to buy {symbol} with ${amount:.2f}")
+        result = await async_buy(symbol, amount=amount)
+        if not result:
+            print(f"[BUY ERROR] {symbol}: Buy failed, refreshing USDC balance and skipping.")
+            await async_fetch_usdc_balance()
+        else:
+            print(f"[INFO] Bought {symbol} for ${amount:.2f}")
+
+async def async_trading_loop():
+    last_sync = time.time()
+    SYNC_INTERVAL = 180
+    while True:
+        try:
+            if market_is_risky():
+                print("[INFO] Market too volatile. Skipping investing this round.")
+                await asyncio.sleep(SYNC_INTERVAL)
+                continue
+            if is_paused():
+                print("[INFO] Bot is paused. Skipping trading logic.")
+                await asyncio.sleep(SYNC_INTERVAL)
+                continue
+            await async_fetch_usdc_balance()
+            await async_auto_sell_momentum_positions()
+            if time.time() - last_sync > SYNC_INTERVAL:
+                sync_investments_with_binance()
+                last_sync = time.time()
+            if not too_many_positions():
+                await async_reserve_taxes_and_reinvest()
+            sync_state()
+            process_actions()
+            await async_fetch_usdc_balance()
+        except Exception as e:
+            print(f"[LOOP ERROR] {e}")
+        sync_positions_with_binance(client, positions)
+        display_portfolio(positions, lambda s: asyncio.run(async_get_latest_price(s)))
+        await asyncio.sleep(SYNC_INTERVAL)
+
+if __name__ == "__main__":
+    refresh_symbols()
+    trade_log = load_trade_history()
+    positions.clear()
+    positions.update(rebuild_cost_basis(trade_log))
+    reconcile_positions_with_binance(client, positions)
+    print(f"[INFO] Bot paused state on startup: {is_paused()}")
+    asyncio.run(async_fetch_usdc_balance())
+    if not is_paused() and balance['usd'] > 10:
+        print("[INFO] Bot is not paused. Making initial investments based on momentum parameters.")
+        asyncio.run(async_reserve_taxes_and_reinvest())
+    try:
+        trading_thread = threading.Thread(target=lambda: asyncio.run(async_trading_loop()), daemon=True)
+        trading_thread.start()
+        telegram_main()
+    except KeyboardInterrupt:
+        print("\n[INFO] Shutting down gracefully...")
+    finally:
+        print("[INFO] Goodbye!")
             key=lambda sym: (is_core(sym), position_profit(sym))
         )
 
