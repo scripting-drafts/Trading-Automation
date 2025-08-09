@@ -24,7 +24,7 @@ import os
 API_KEY = os.environ['BINANCE_KEY']
 API_SECRET = os.environ['BINANCE_SECRET']
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
-TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+TELEGRAM_CHAT_ID = int(os.environ['TELEGRAM_CHAT_ID'])
 
 import apscheduler.util
 
@@ -932,7 +932,8 @@ def invest_momentum_with_usdc_limit(usdc_limit):
 
 def get_bot_state():
     if not os.path.exists(BOT_STATE_FILE):
-        return {"balance": 0, "positions": {}, "paused": True, "log": [], "actions": []}
+        # Resume trading by default on startup (changed from paused: True)
+        return {"balance": 0, "positions": {}, "paused": False, "log": [], "actions": []}
     with open(BOT_STATE_FILE, "r") as f:
         return json.load(f)
 
@@ -1022,6 +1023,13 @@ if __name__ == "__main__":
     positions.update(rebuild_cost_basis(trade_log))
     reconcile_positions_with_binance(client, positions)
     print(f"[INFO] Bot paused state on startup: {is_paused()}")
+    
+    # Make initial investment if bot is not paused and has funds
+    fetch_usdc_balance()
+    if not is_paused() and balance['usd'] > 10:
+        print("[INFO] Bot is unpaused and has funds. Making initial investments...")
+        reserve_taxes_and_reinvest()
+    
     try:
         trading_thread = threading.Thread(target=trading_loop, daemon=True)
         trading_thread.start()
