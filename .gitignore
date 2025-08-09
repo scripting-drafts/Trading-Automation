@@ -5,3 +5,4 @@ bot_state.json
 symbols.yaml
 trades_detailed.csv
 __pycache__
+.env

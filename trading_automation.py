@@ -18,6 +18,7 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 load_dotenv()
+# from secret import API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 import os
 import requests.exceptions
@@ -57,10 +58,27 @@ BOT_STATE_FILE = "bot_state.json"
 client = Client(API_KEY, API_SECRET)
 # --- Time Sync Patch: ---
 try:
+    client = Client(API_KEY, API_SECRET)
+    # Test the API connection
     client.get_server_time()
     print("[INFO] Synced time with Binance server.")
+    
+    # Test account access
+    account_info = client.get_account()
+    print(f"[INFO] Successfully authenticated with Binance. Account type: {account_info.get('accountType', 'Unknown')}")
+    
+except BinanceAPIException as e:
+    print(f"[ERROR] Binance API Error: {e}")
+    if e.code == -2014:
+        print("[ERROR] API key format is invalid. Please check your BINANCE_KEY environment variable.")
+    elif e.code == -1022:
+        print("[ERROR] Invalid signature. Please check your BINANCE_SECRET environment variable.")
+    elif e.code == -2015:
+        print("[ERROR] Invalid API key, IP, or permissions. Check your API key settings on Binance.")
+    exit(1)
 except Exception as e:
-    print(f"[ERROR] Could not sync time with Binance server: {e}")
+    print(f"[ERROR] Failed to connect to Binance: {e}")
+    exit(1)
 
 positions = {}        # single global positions dict
 balance = {'usd': 0.0}
@@ -161,6 +179,13 @@ def fetch_usdc_balance():
         free = float(asset_info['free'])
         balance['usd'] = free
         print(f"[DEBUG] Live USDC balance: {free}")
+    except BinanceAPIException as e:
+        print(f"[ERROR] Fetching USDC balance - Binance API Error: {e}")
+        if e.code == -2014:
+            print("[ERROR] API key format invalid. Please check your credentials.")
+        elif e.code == -1022:
+            print("[ERROR] Invalid signature. Please check your API secret.")
+        balance['usd'] = 0
     except Exception as e:
         print(f"[ERROR] Fetching USDC balance: {e}")
         balance['usd'] = 0
@@ -851,18 +876,28 @@ def has_recent_momentum(symbol, min_1m=MIN_1M, min_5m=MIN_5M, min_15m=MIN_15M):
         klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=2)
         klines_5m = client.get_klines(symbol=symbol, interval='5m', limit=2)
         klines_15m = client.get_klines(symbol=symbol, interval='15m', limit=2)
+        
         change_1m = pct_change(klines_1m)
         change_5m = pct_change(klines_5m)
         change_15m = pct_change(klines_15m)
         print(f"[DEBUG] {symbol}: 1m={change_1m:.4f} 5m={change_5m:.4f} 15m={change_15m:.4f}")
         
-        # Only require 2 out of 3 timeframes to show momentum instead of all 3
+        # Even more relaxed: 
+        # 1. Only need 1 out of 3 timeframes to show momentum
+        # 2. Or need at least one very strong momentum (3x the minimum)
         momentum_count = 0
         if change_1m > min_1m: momentum_count += 1
         if change_5m > min_5m: momentum_count += 1
         if change_15m > min_15m: momentum_count += 1
         
-        return momentum_count >= 2  # Only need 2 out of 3 timeframes
+        # Strong momentum in any timeframe counts
+        strong_momentum = (
+            change_1m > min_1m * 3 or
+            change_5m > min_5m * 3 or
+            change_15m > min_15m * 3
+        )
+        
+        return momentum_count >= 1 or strong_momentum
     except Exception as e:
         print(f"[ERROR] Momentum check failed for {symbol}: {e}")
         return False
@@ -872,59 +907,123 @@ def get_yaml_ranked_momentum(
         min_marketcap=MIN_MARKETCAP, 
         min_volume=MIN_VOLUME, 
         min_volatility=MIN_VOLATILITY):
+    """Get symbols ranked by momentum, with improved debugging and fallback logic"""
+    # Load stats and add debugging output
     stats = load_symbol_stats()
+    print(f"[DEBUG] Loaded {len(stats)} symbols from YAML file")
     if not stats:
-        return []
+        print("[ERROR] No symbols in YAML file!")
+        # Return at least BTCUSDC as fallback
+        return ["BTCUSDC"]
+    
+    # Get ticker data
     tickers = {t['symbol']: t for t in client.get_ticker() if t['symbol'] in stats}
+    print(f"[DEBUG] Found {len(tickers)} matching symbols in ticker data")
+    
     candidates = []
+    filtered_out = {
+        "ticker": 0,
+        "marketcap": 0,
+        "volume": 0,
+        "volatility": 0,
+        "momentum": 0
+    }
+    
+    # Use more relaxed criteria for the first run if nothing passes
+    relaxed_mode = False
+    
     for symbol, s in stats.items():
         ticker = tickers.get(symbol)
         if not ticker:
-            print(f"[SKIP] {symbol}: Not in live ticker data")
+            filtered_out["ticker"] += 1
             continue
+            
         mc = s.get("market_cap", 0) or 0
         vol = s.get("volume_1d", 0) or 0
         vola = s.get("volatility", {}).get("1d", 0) or 0
-        price_change = float(ticker.get('priceChangePercent', 0))
-        if mc < min_marketcap:
-            print(f"[SKIP] {symbol}: market_cap {mc} < min {min_marketcap}")
+        
+        if mc < min_marketcap and not relaxed_mode:
+            filtered_out["marketcap"] += 1
             continue
-        if vol < min_volume:
-            print(f"[SKIP] {symbol}: volume {vol} < min {min_volume}")
+            
+        if vol < min_volume and not relaxed_mode:
+            filtered_out["volume"] += 1
             continue
-        if vola < min_volatility:
-            print(f"[SKIP] {symbol}: volatility {vola} < min {min_volatility}")
-            continue
-        if not has_recent_momentum(symbol):
-            print(f"[SKIP] {symbol}: has no recent momentum")
+            
+        if vola < min_volatility and not relaxed_mode:
+            filtered_out["volatility"] += 1
             continue
         
-        # Calculate the momentum score (sum of recent % changes)
-        k1m = client.get_klines(symbol=symbol, interval='1m', limit=2)
-        k5m = client.get_klines(symbol=symbol, interval='5m', limit=2)
-        k15m = client.get_klines(symbol=symbol, interval='15m', limit=2)
-        k1h = client.get_klines(symbol=symbol, interval='1h', limit=2)
-        momentum_score = (
-            pct_change(k1m)
-            + pct_change(k5m) * 1.5
-            + pct_change(k15m) * 2
-            + pct_change(k1h)
-        )
-        candidates.append({
-            "symbol": symbol,
-            "market_cap": mc,
-            "volume": vol,
-            "volatility": vola,
-            "price_change": price_change,
-            "momentum_score": momentum_score,
-        })
+        # Try to get momentum with a timeout to avoid hanging
+        momentum_ok = False
+        try:
+            momentum_ok = has_recent_momentum(symbol, 
+                                             min_1m=MIN_1M/2 if relaxed_mode else MIN_1M,
+                                             min_5m=MIN_5M/2 if relaxed_mode else MIN_5M,
+                                             min_15m=MIN_15M/2 if relaxed_mode else MIN_15M)
+        except Exception as e:
+            print(f"[ERROR] Momentum check for {symbol} failed: {e}")
+            
+        if not momentum_ok:
+            filtered_out["momentum"] += 1
+            continue
+            
+        # Calculate momentum score
+        try:
+            k1m = client.get_klines(symbol=symbol, interval='1m', limit=2)
+            k5m = client.get_klines(symbol=symbol, interval='5m', limit=2)
+            k15m = client.get_klines(symbol=symbol, interval='15m', limit=2)
+            k1h = client.get_klines(symbol=symbol, interval='1h', limit=2)
+            
+            momentum_score = (
+                pct_change(k1m)
+                + pct_change(k5m) * 1.5
+                + pct_change(k15m) * 2
+                + pct_change(k1h)
+            )
+            
+            candidates.append({
+                "symbol": symbol,
+                "market_cap": mc,
+                "volume": vol,
+                "volatility": vola,
+                "momentum_score": momentum_score,
+            })
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to calculate momentum for {symbol}: {e}")
+    
+    # Print debugging info
+    print(f"[DEBUG] Filtered out: {filtered_out}")
+    print(f"[DEBUG] Found {len(candidates)} candidates that passed all filters")
+    
+    # If no candidates, try again with relaxed mode or use fallback
+    if not candidates:
+        if not relaxed_mode:
+            print("[INFO] No candidates with normal criteria. Trying with relaxed criteria.")
+            relaxed_mode = True
+            # Retry with relaxed criteria by recursively calling with half the minimums
+            return get_yaml_ranked_momentum(
+                limit=limit,
+                min_marketcap=min_marketcap/2,
+                min_volume=min_volume/2,
+                min_volatility=min_volatility/2
+            )
+        else:
+            print("[WARN] No candidates even with relaxed criteria. Using fallback coins.")
+            # Use fallback coins (BTC, ETH, BNB)
+            return ["BTCUSDC", "ETHUSDC", "BNBUSDC"]
 
+    # Sort and return the top symbols
     ranked = sorted(
         candidates, 
         key=lambda x: (x["momentum_score"], x["market_cap"], x["volume"]), 
         reverse=True
     )
-    return [x["symbol"] for x in ranked[:limit]]
+    
+    top_symbols = [x["symbol"] for x in ranked[:limit]]
+    print(f"[INFO] Top momentum symbols: {top_symbols}")
+    return top_symbols
 
 def refresh_symbols():
     global SYMBOLS
@@ -1079,6 +1178,7 @@ def has_recent_momentum(symbol, min_1m=MIN_1M, min_5m=MIN_5M, min_15m=MIN_15M):
         klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=2)
         klines_5m = client.get_klines(symbol=symbol, interval='5m', limit=2)
         klines_15m = client.get_klines(symbol=symbol, interval='15m', limit=2)
+        
         change_1m = pct_change(klines_1m)
         change_5m = pct_change(klines_5m)
         change_15m = pct_change(klines_15m)
