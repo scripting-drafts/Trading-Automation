@@ -358,328 +358,6 @@ async def telegram_handle_message(update: Update, context: ContextTypes.DEFAULT_
                     print(f"[WARN] Bad trade log row: {tr} ({e})")
                     continue
             await send_with_keyboard(update, f"```{msg}```", parse_mode='Markdown')
-    elif text == "🚀 Force Trade":
-        # Add new force trade option
-        fetch_usdc_balance()
-        if balance['usd'] < 10:
-            await send_with_keyboard(update, "❌ Not enough USDC balance (min $10 needed)")
-            return
-        
-        symbol = "BTCUSDC"  # Default to Bitcoin
-        amount = min(balance['usd'], 10)  # Use at most $10 or available balance
-        
-        result = buy(symbol, amount=amount)
-        if result:
-            await send_with_keyboard(update, f"✅ Force bought {symbol} for ${amount:.2f}")
-        else:
-            # Try alternate coins if BTC fails
-            for alt_symbol in ["ETHUSDC", "BNBUSDC", "SOLUSDC"]:
-                result = buy(alt_symbol, amount=amount)
-                if result:
-                    await send_with_keyboard(update, f"✅ Force bought {alt_symbol} for ${amount:.2f}")
-                    break
-            else:
-                await send_with_keyboard(update, "❌ Force buy failed for all coins")
-    
-    else:
-        await send_with_keyboard(update, "Unknown action.")
-
-def load_trade_history():
-    log = []
-    if os.path.exists(TRADE_LOG_FILE):
-        try:
-            with open(TRADE_LOG_FILE, "r") as f:
-                reader = csv.DictReader(f)
-                log = list(reader)
-        except Exception as e:
-            print(f"[LOAD TRADE ERROR] {e}")
-    return log
-
-def rebuild_cost_basis(trade_log):
-    positions_tmp = {}
-    for tr in trade_log:
-        symbol = tr.get('Symbol')
-        qty = float(tr.get('Qty', 0))
-        entry = float(tr.get('Entry', 0))
-        action = 'buy' if float(tr.get('Entry', 0)) > 0 else 'sell'
-        action = tr.get('action', '').lower() if 'action' in tr else (action)
-        tstamp = parse_trade_time(tr.get('Time'), time.time())
-        if symbol not in positions_tmp:
-            positions_tmp[symbol] = {'qty': 0.0, 'cost': 0.0, 'trade_time': tstamp}
-        if action == 'buy':
-            positions_tmp[symbol]['qty'] += qty
-            positions_tmp[symbol]['cost'] += qty * entry
-            positions_tmp[symbol]['trade_time'] = tstamp
-        elif action == 'sell':
-            orig_qty = positions_tmp[symbol]['qty']
-            if orig_qty > 0 and qty > 0:
-                avg_entry = positions_tmp[symbol]['cost'] / orig_qty
-                positions_tmp[symbol]['qty'] -= qty
-                positions_tmp[symbol]['cost'] -= qty * avg_entry
-                positions_tmp[symbol]['trade_time'] = tstamp
-                if positions_tmp[symbol]['qty'] < 1e-8:
-                    positions_tmp[symbol]['qty'] = 0
-                    positions_tmp[symbol]['cost'] = 0
-    cost_basis = {}
-    for symbol, v in positions_tmp.items():
-        if v['qty'] > 0:
-            avg_entry = v['cost'] / v['qty'] if v['qty'] > 0 else 0.0
-            cost_basis[symbol] = {
-                'qty': v['qty'],
-                'entry': avg_entry,
-                'trade_time': v['trade_time'],  # now always float
-            }
-    return cost_basis
-
-
-def reconcile_positions_with_binance(client, positions, quote_asset="USDC"):
-    """Update local 'positions' to match true Binance balances for all open positions."""
-    try:
-        account = client.get_account()
-        assets = {b['asset']: float(b['free']) for b in account['balances'] if float(b['free']) > 0}
-        for asset, qty in assets.items():
-            if asset == quote_asset:
-                continue
-            symbol = asset + quote_asset
-            if symbol in positions:
-                positions[symbol]['qty'] = qty
-            else:
-                positions[symbol] = {'qty': qty, 'entry': 0.0, 'trade_time': 0}
-        for symbol in list(positions):
-            base = symbol.replace(quote_asset, "")
-            if base not in assets or assets[base] == 0:
-                positions.pop(symbol)
-    except Exception as e:
-        print(f"[SYNC ERROR] Failed to reconcile with Binance: {e}")
-
-def fetch_usdc_balance():
-    """Update the global USDC balance from Binance live."""
-    try:
-        asset_info = client.get_asset_balance(asset="USDC")
-        free = float(asset_info['free'])
-        balance['usd'] = free
-        print(f"[DEBUG] Live USDC balance: {free}")
-    except Exception as e:
-        print(f"[ERROR] Fetching USDC balance: {e}")
-        balance['usd'] = 0
-
-def get_latest_price(symbol):
-    try:
-        return float(client.get_symbol_ticker(symbol=symbol)["price"])
-    except Exception as e:
-        print(f"[PRICE ERROR] {symbol}: {e}")
-        return None
-
-def min_notional_for(symbol):
-    try:
-        info = client.get_symbol_info(symbol)
-        for f in info['filters']:
-            if f['filterType'] == 'MIN_NOTIONAL':
-                return float(f['notional'])
-        return 10.0
-    except Exception:
-        return 10.0
-
-def lot_step_size_for(symbol):
-    try:
-        info = client.get_symbol_info(symbol)
-        for f in info['filters']:
-            if f['filterType'] == 'LOT_SIZE':
-                step_size = float(f['stepSize'])
-                min_qty = float(f['minQty'])
-                return step_size, min_qty
-    except Exception:
-        pass
-    return 0.000001, 0.000001
-
-def round_qty(symbol, qty):
-    """Binance-compliant rounding for quantity."""
-    info = client.get_symbol_info(symbol)
-    step_size = None
-    for f in info['filters']:
-        if f['filterType'] == 'LOT_SIZE':
-            step_size = float(f['stepSize'])
-            break
-    if step_size is None:
-        return qty
-    d_qty = decimal.Decimal(str(qty))
-    d_step = decimal.Decimal(str(step_size))
-    rounded_qty = float((d_qty // d_step) * d_step)
-    if rounded_qty < step_size:
-        return 0
-    return rounded_qty
-
-def get_sellable_positions():
-    """Return {symbol: pos} for sellable positions (passes step and notional filters)."""
-    out = {}
-    for symbol, pos in positions.items():
-        qty = pos.get("qty", 0)
-        sell_qty = round_qty(symbol, qty)
-        current_price = get_latest_price(symbol)
-        value = current_price * sell_qty
-        if sell_qty == 0 or qty == 0:
-            # print(f"[SKIP] {symbol}: Qty after rounding is 0. Skipping sell for now.")
-            continue
-        if value < DUST_LIMIT:
-            print(f"[SKIP] {symbol}: Value after rounding is ${value:.2f} (below DUST_LIMIT ${DUST_LIMIT}), skipping sell.")
-            continue
-        try:
-            min_notional = min_notional_for(symbol)
-            current_price = get_latest_price(symbol)
-            if current_price is None:
-                print(f"[SKIP] {symbol}: Could not fetch price (None), skipping auto-sell logic.")
-                continue
-            if sell_qty == 0:
-                continue
-            if sell_qty * current_price < min_notional:
-                continue
-            out[symbol] = pos
-        except Exception:
-            continue
-    return out
-
-def get_portfolio_lines(positions, get_latest_price, dust_limit=1.0):
-    lines = []
-    for symbol, pos in positions.items():
-        qty = pos['qty']
-        entry = pos['entry']
-        try:
-            current_price = get_latest_price(symbol)
-            if current_price is None:
-                print(f"[SKIP] {symbol}: Could not fetch price (None), skipping auto-sell logic.")
-                continue
-        except Exception:
-            current_price = entry
-        value = qty * current_price
-        if value < dust_limit:
-            continue
-        pnl_pct = ((current_price - entry) / entry * 100) if entry else 0
-        lines.append((symbol, qty, entry, current_price, value, pnl_pct))
-    return lines
-
-def display_portfolio(positions, get_latest_price, dust_limit=1.0):
-    print(f"\nCurrent Portfolio (positions over {dust_limit}€):")
-    lines = get_portfolio_lines(positions, get_latest_price, dust_limit)
-    if not lines:
-        print(f"  (No positions over {dust_limit}€)")
-        return
-    for symbol, qty, entry, price, value, pnl_pct in lines:
-        print(f"  {symbol:<12} qty={qty:.6f} entry={entry:.4f} now={price:.4f} value={value:.2f}€ PnL={pnl_pct:+.2f}%")
-
-def format_investments_message(positions, get_latest_price, dust_limit=1.0):
-    lines = get_portfolio_lines(positions, get_latest_price, dust_limit)
-    if not lines:
-        return f"(No investments over {dust_limit}€)"
-    msg = "Current Investments:"
-    for symbol, qty, entry, price, value, pnl_pct in lines:
-        msg += (
-            f"\n\n{symbol}: Qty {qty:.4f} @ {entry:.5f} → {price:.5f} | Value ${value:.2f} | PnL {pnl_pct:+.2f}%"
-        )
-    return msg
-
-async def telegram_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != TELEGRAM_CHAT_ID:
-        await send_with_keyboard(update, "Access Denied.")
-        return
-
-    text = update.message.text
-    sync_positions_with_binance(client, positions)
-
-    if text == "📊 Balance":
-        fetch_usdc_balance()
-
-        usdc = balance['usd']
-        total_invested = 0.0
-        invested_details = []
-
-        for s, p in positions.items():
-            price = get_latest_price(s)
-            if price is None:
-                continue
-            qty = float(p['qty'])
-            value = price * qty
-            # Only show if value is above DUST_LIMIT
-            if value > DUST_LIMIT:
-                total_invested += value
-                invested_details.append(f"{s}: {qty:.6f} @ ${price:.2f} = ${value:.2f}")
-
-        msg = (
-            f"USDC Balance: **${usdc:.2f}**\n"
-            f"Total Invested: **${total_invested:.2f}**\n"
-            f"Portfolio Value: **${usdc + total_invested:.2f} USDC**"
-        )
-
-        if invested_details:
-            msg += "\n\n*Investments:*"
-            for line in invested_details:
-                msg += f"\n- {line}"
-
-        await send_with_keyboard(update, msg, parse_mode='Markdown')
-
-
-    
-    elif text == "💼 Investments":
-        msg = format_investments_message(positions, get_latest_price, DUST_LIMIT)
-        await send_with_keyboard(update, msg)
-    
-    elif text == "⏸ Pause Trading":
-        set_paused(True)
-        await send_with_keyboard(update, "⏸ Trading is now *paused*. Bot will not auto-invest or auto-sell until resumed.", parse_mode='Markdown')
-
-    elif text == "▶️ Resume Trading":
-        set_paused(False)
-        await send_with_keyboard(update, "▶️ Trading is *resumed*. Bot will continue auto-investing and auto-selling.", parse_mode='Markdown')
-
-    elif text == "📝 Trade Log":
-        log = trade_log
-        if not log:
-            await send_with_keyboard(update, "No trades yet.")
-        else:
-            msg = (
-                "Time                 Symbol       Entry      Exit       Qty        PnL($)\n"
-                "-----------------------------------------------------------------------\n"
-            )
-            for tr in log[-10:]:
-                try:
-                    entry = float(tr.get('Entry', 0))
-                    exit_ = float(tr.get('Exit', 0))
-                    qty = float(tr.get('Qty', 0))
-                    pnl = float(tr.get('PnL $', 0))
-                    msg += (
-                        f"{tr['Time'][:16]:<19} "
-                        f"{tr['Symbol']:<11} "
-                        f"{entry:<9.4f} "
-                        f"{exit_:<9.4f} "
-                        f"{qty:<9.5f} "
-                        f"{pnl:<8.2f}\n"
-                    )
-                except (ValueError, KeyError) as e:
-                    print(f"[WARN] Bad trade log row: {tr} ({e})")
-                    continue
-            await send_with_keyboard(update, f"```{msg}```", parse_mode='Markdown')
-    elif text == "🚀 Force Trade":
-        # Add new force trade option
-        fetch_usdc_balance()
-        if balance['usd'] < 10:
-            await send_with_keyboard(update, "❌ Not enough USDC balance (min $10 needed)")
-            return
-        
-        symbol = "BTCUSDC"  # Default to Bitcoin
-        amount = min(balance['usd'], 10)  # Use at most $10 or available balance
-        
-        result = buy(symbol, amount=amount)
-        if result:
-            await send_with_keyboard(update, f"✅ Force bought {symbol} for ${amount:.2f}")
-        else:
-            # Try alternate coins if BTC fails
-            for alt_symbol in ["ETHUSDC", "BNBUSDC", "SOLUSDC"]:
-                result = buy(alt_symbol, amount=amount)
-                if result:
-                    await send_with_keyboard(update, f"✅ Force bought {alt_symbol} for ${amount:.2f}")
-                    break
-            else:
-                await send_with_keyboard(update, "❌ Force buy failed for all coins")
-    
     else:
         await send_with_keyboard(update, "Unknown action.")
 
@@ -721,7 +399,7 @@ def is_paused():
 main_keyboard = [
     ["📊 Balance", "💼 Investments"],
     ["⏸ Pause Trading", "▶️ Resume Trading"],
-    ["📝 Trade Log", "🚀 Force Trade"]
+    ["📝 Trade Log"]
 ]
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -925,14 +603,9 @@ def get_1h_percent_change(symbol):
     return (last_close - prev_close) / prev_close * 100
 
 def market_is_risky():
-    # For the first 24 hours after starting, never consider market risky
-    global bot_start_time
-    if time.time() - bot_start_time < 24 * 3600:  # 24 hours
-        return False
-        
-    # Regular check
+    # For example, check if BTCUSDT 1h change is negative or > X% move
     btc_change_1h = get_1h_percent_change("BTCUSDT")
-    return btc_change_1h < -3 or abs(btc_change_1h) > 5  # More permissive thresholds
+    return btc_change_1h < -1 or abs(btc_change_1h) > 3
 
 def sync_investments_with_binance():
     try:
@@ -1302,52 +975,28 @@ def process_actions():
 def trading_loop():
     last_sync = time.time()
     SYNC_INTERVAL = 180
-    iteration = 0
-    
-    # Force initial trading attempt when bot starts
-    print("[INFO] Attempting to force initial trading...")
-    force_initial_trading()
 
     while True:
-        iteration += 1
-        print(f"\n[INFO] Trading loop iteration #{iteration}")
-        
         try:
-            print("[CHECK] Checking if market is risky...")
             if market_is_risky():
                 print("[INFO] Market too volatile. Skipping investing this round.")
                 time.sleep(SYNC_INTERVAL)
                 continue
-            
-            print("[CHECK] Checking if bot is paused...")
+
             if is_paused():
                 print("[INFO] Bot is paused. Skipping trading logic.")
                 time.sleep(SYNC_INTERVAL)
                 continue
 
-            print("[CHECK] Fetching USDC balance...")
             fetch_usdc_balance()
-            print(f"[INFO] Current USDC balance: ${balance['usd']:.2f}")
-            
-            print("[ACTION] Running auto-sell logic...")
             auto_sell_momentum_positions()  # <<< use new sell logic
 
             if time.time() - last_sync > SYNC_INTERVAL:
-                print("[ACTION] Syncing investments with Binance...")
                 sync_investments_with_binance()
                 last_sync = time.time()
 
-            print("[CHECK] Checking position count...")
-            if too_many_positions():
-                print(f"[INFO] Already have maximum {MAX_POSITIONS} positions. Skipping investment.")
-            else:
-                print("[ACTION] Running investment logic...")
-                reserve_taxes_and_reinvest()
-                
-                # If we have no positions after trying to invest, force a trade
-                if len(positions) == 0 and balance['usd'] > 10 and iteration > 1:
-                    print("[ACTION] No positions after investment attempt. Forcing trade...")
-                    force_initial_trading()
+            if not too_many_positions():
+                reserve_taxes_and_reinvest()  # <<<< THIS IS THE NEW LOGIC
 
             sync_state()
             process_actions()
@@ -1450,9 +1099,6 @@ def emergency_trade():
 
 # 5. Modify the main block to include more diagnostic info and emergency trading
 if __name__ == "__main__":
-    # Store bot start time
-    bot_start_time = time.time()
-    
     refresh_symbols()
     trade_log = load_trade_history()
     positions.clear()
@@ -1471,21 +1117,26 @@ if __name__ == "__main__":
     fetch_usdc_balance()
     print(f"[INFO] Starting USDC balance: ${balance['usd']}")
     
-    # Always attempt to force initial trade
-    if balance['usd'] > 10:
-        print("[INFO] Bot has funds. Forcing initial investment...")
-        force_initial_trading()
+    # Make initial investment if conditions are right
+    if not paused and balance['usd'] > 10:
+        print("[INFO] Bot is unpaused and has funds. Making initial investments...")
+        try:
+            # Try regular investment first
+            momentum_symbols = get_yaml_ranked_momentum(limit=3)
+            if momentum_symbols:
+                print(f"[INFO] Found momentum symbols: {momentum_symbols}")
+                reserve_taxes_and_reinvest()
+            else:
+                print("[WARN] No momentum symbols found. Trying emergency trade...")
+                emergency_trade()
+        except Exception as e:
+            print(f"[ERROR] Initial investment failed: {e}")
+            print("[INFO] Trying emergency trade...")
+            emergency_trade()
     
     try:
         trading_thread = threading.Thread(target=trading_loop, daemon=True)
         trading_thread.start()
-        
-        # Wait a few seconds to see if trading starts
-        time.sleep(5)
-        if len(positions) == 0 and balance['usd'] > 10:
-            print("[WARNING] No positions detected after 5 seconds. Trying emergency trade...")
-            emergency_trade()
-            
         telegram_main()  # This blocks; run in main thread for proper Ctrl+C
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down gracefully...")
