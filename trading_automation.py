@@ -793,13 +793,23 @@ def reserve_taxes_and_reinvest():
     invest_momentum_with_usdc_limit(investable_usdc)
 
 def load_symbol_stats():
+    """Load symbol stats from YAML with better error handling"""
+    if not os.path.exists(YAML_SYMBOLS_FILE):
+        print(f"[ERROR] Symbol file {YAML_SYMBOLS_FILE} does not exist! Creating empty file.")
+        with open(YAML_SYMBOLS_FILE, 'w') as f:
+            yaml.dump({'BTCUSDC': {'market_cap': 1000000000000, 'volume_1d': 10000000000, 'volatility': {'1d': 0.01}}}, f)
+    
     try:
         with open(YAML_SYMBOLS_FILE, "r") as f:
-            return yaml.safe_load(f)
+            data = yaml.safe_load(f)
+            if not data:
+                print(f"[ERROR] Symbol file {YAML_SYMBOLS_FILE} is empty or invalid!")
+                return {'BTCUSDC': {'market_cap': 1000000000000, 'volume_1d': 10000000000, 'volatility': {'1d': 0.01}}}
+            return data
     except Exception as e:
         print(f"[YAML ERROR] Could not read {YAML_SYMBOLS_FILE}: {e}")
-        return {}
-    
+        return {'BTCUSDC': {'market_cap': 1000000000000, 'volume_1d': 10000000000, 'volatility': {'1d': 0.01}}}
+
 def pct_change(klines):
     if len(klines) < 2: return 0
     prev_close = float(klines[0][4])
@@ -811,13 +821,20 @@ def has_recent_momentum(symbol, min_1m=MIN_1M, min_5m=MIN_5M, min_15m=MIN_15M):
         klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=2)
         klines_5m = client.get_klines(symbol=symbol, interval='5m', limit=2)
         klines_15m = client.get_klines(symbol=symbol, interval='15m', limit=2)
-        print(f"[DEBUG] {symbol}: 1m={pct_change(klines_1m):.4f} 5m={pct_change(klines_5m):.4f} 15m={pct_change(klines_15m):.4f}")
-        return (
-            pct_change(klines_1m) > min_1m and
-            pct_change(klines_5m) > min_5m and
-            pct_change(klines_15m) > min_15m
-        )
-    except Exception:
+        change_1m = pct_change(klines_1m)
+        change_5m = pct_change(klines_5m)
+        change_15m = pct_change(klines_15m)
+        print(f"[DEBUG] {symbol}: 1m={change_1m:.4f} 5m={change_5m:.4f} 15m={change_15m:.4f}")
+        
+        # Only require 2 out of 3 timeframes to show momentum instead of all 3
+        momentum_count = 0
+        if change_1m > min_1m: momentum_count += 1
+        if change_5m > min_5m: momentum_count += 1
+        if change_15m > min_15m: momentum_count += 1
+        
+        return momentum_count >= 2  # Only need 2 out of 3 timeframes
+    except Exception as e:
+        print(f"[ERROR] Momentum check failed for {symbol}: {e}")
         return False
 
 def get_yaml_ranked_momentum(
@@ -1016,19 +1033,106 @@ def resume_positions_from_binance():
     except Exception:
         return {}
 
+# 1. Modify the momentum criteria to be less strict (around line 620)
+def has_recent_momentum(symbol, min_1m=MIN_1M, min_5m=MIN_5M, min_15m=MIN_15M):
+    try:
+        klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=2)
+        klines_5m = client.get_klines(symbol=symbol, interval='5m', limit=2)
+        klines_15m = client.get_klines(symbol=symbol, interval='15m', limit=2)
+        change_1m = pct_change(klines_1m)
+        change_5m = pct_change(klines_5m)
+        change_15m = pct_change(klines_15m)
+        print(f"[DEBUG] {symbol}: 1m={change_1m:.4f} 5m={change_5m:.4f} 15m={change_15m:.4f}")
+        
+        # Only require 2 out of 3 timeframes to show momentum instead of all 3
+        momentum_count = 0
+        if change_1m > min_1m: momentum_count += 1
+        if change_5m > min_5m: momentum_count += 1
+        if change_15m > min_15m: momentum_count += 1
+        
+        return momentum_count >= 2  # Only need 2 out of 3 timeframes
+    except Exception as e:
+        print(f"[ERROR] Momentum check failed for {symbol}: {e}")
+        return False
+
+# 2. Add debug function to force buy a specific symbol
+def debug_force_buy(symbol, amount=10):
+    """Force buy a specific symbol for debugging purposes"""
+    print(f"[DEBUG] Force buying {symbol} with ${amount}")
+    result = buy(symbol, amount=amount)
+    if result:
+        print(f"[DEBUG] Successfully bought {symbol}")
+        return True
+    else:
+        print(f"[DEBUG] Failed to buy {symbol}")
+        return False
+
+# 3. Better error handling for YAML file
+def load_symbol_stats():
+    """Load symbol stats from YAML with better error handling"""
+    if not os.path.exists(YAML_SYMBOLS_FILE):
+        print(f"[ERROR] Symbol file {YAML_SYMBOLS_FILE} does not exist! Creating empty file.")
+        with open(YAML_SYMBOLS_FILE, 'w') as f:
+            yaml.dump({'BTCUSDC': {'market_cap': 1000000000000, 'volume_1d': 10000000000, 'volatility': {'1d': 0.01}}}, f)
+    
+    try:
+        with open(YAML_SYMBOLS_FILE, "r") as f:
+            data = yaml.safe_load(f)
+            if not data:
+                print(f"[ERROR] Symbol file {YAML_SYMBOLS_FILE} is empty or invalid!")
+                return {'BTCUSDC': {'market_cap': 1000000000000, 'volume_1d': 10000000000, 'volatility': {'1d': 0.01}}}
+            return data
+    except Exception as e:
+        print(f"[YAML ERROR] Could not read {YAML_SYMBOLS_FILE}: {e}")
+        return {'BTCUSDC': {'market_cap': 1000000000000, 'volume_1d': 10000000000, 'volatility': {'1d': 0.01}}}
+
+# 4. Add emergency trading function
+def emergency_trade():
+    """Emergency function to make trades when normal trading isn't working"""
+    fetch_usdc_balance()
+    if balance['usd'] < 10:
+        print("[ERROR] Not enough USDC balance for emergency trade")
+        return False
+    
+    # Try to buy Bitcoin as a fallback
+    return debug_force_buy("BTCUSDC", min(balance['usd'], 10))
+
+# 5. Modify the main block to include more diagnostic info and emergency trading
 if __name__ == "__main__":
     refresh_symbols()
     trade_log = load_trade_history()
     positions.clear()
     positions.update(rebuild_cost_basis(trade_log))
     reconcile_positions_with_binance(client, positions)
-    print(f"[INFO] Bot paused state on startup: {is_paused()}")
     
-    # Make initial investment if bot is not paused and has funds
+    # Check if YAML file exists and has valid data
+    symbols_data = load_symbol_stats()
+    print(f"[INFO] Loaded {len(symbols_data)} symbols from YAML file")
+    
+    # Print paused state
+    paused = is_paused()
+    print(f"[INFO] Bot paused state on startup: {paused}")
+    
+    # Check USDC balance
     fetch_usdc_balance()
-    if not is_paused() and balance['usd'] > 10:
+    print(f"[INFO] Starting USDC balance: ${balance['usd']}")
+    
+    # Make initial investment if conditions are right
+    if not paused and balance['usd'] > 10:
         print("[INFO] Bot is unpaused and has funds. Making initial investments...")
-        reserve_taxes_and_reinvest()
+        try:
+            # Try regular investment first
+            momentum_symbols = get_yaml_ranked_momentum(limit=3)
+            if momentum_symbols:
+                print(f"[INFO] Found momentum symbols: {momentum_symbols}")
+                reserve_taxes_and_reinvest()
+            else:
+                print("[WARN] No momentum symbols found. Trying emergency trade...")
+                emergency_trade()
+        except Exception as e:
+            print(f"[ERROR] Initial investment failed: {e}")
+            print("[INFO] Trying emergency trade...")
+            emergency_trade()
     
     try:
         trading_thread = threading.Thread(target=trading_loop, daemon=True)
