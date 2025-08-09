@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-
+ 
 API_KEY = os.environ['BINANCE_KEY']
 API_SECRET = os.environ['BINANCE_SECRET']
 
