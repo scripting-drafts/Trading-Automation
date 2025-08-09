@@ -932,7 +932,8 @@ def invest_momentum_with_usdc_limit(usdc_limit):
 
 def get_bot_state():
     if not os.path.exists(BOT_STATE_FILE):
-        return {"balance": 0, "positions": {}, "paused": True, "log": [], "actions": []}
+        # Resume trading by default on startup
+        return {"balance": 0, "positions": {}, "paused": False, "log": [], "actions": []}
     with open(BOT_STATE_FILE, "r") as f:
         return json.load(f)
 
